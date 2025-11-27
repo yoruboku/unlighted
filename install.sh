@@ -1,62 +1,52 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -e
 
-# CloudSync installer for Linux
-# - Creates venv in current folder
-# - Installs deps
-# - Ensures rclone is configured
-# - Starts main.py
+# Synco installer (Linux)
+# - Creates a Python venv in ./venv
+# - Marks main.py executable
+# - Creates start.sh and stop.sh wrappers
 
-# Get directory of this script
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
+PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-echo "=========================================="
-echo " CloudSync Installer - Linux"
-echo "=========================================="
+echo "[synco] Project directory: $PROJECT_DIR"
 
-# Pick python command
-if command -v python3 &> /dev/null; then
-    PY=python3
-elif command -v python &> /dev/null; then
-    PY=python
-else
-    echo "No python interpreter found. Install python first."
-    exit 1
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "[synco] python3 not found. Install Python 3 first."
+  exit 1
 fi
 
-echo "[*] Creating virtual environment (./venv)..."
-$PY -m venv venv
+echo "[synco] Creating virtual environment..."
+python3 -m venv "$PROJECT_DIR/venv"
 
-echo "[*] Activating venv..."
-# shellcheck disable=SC1091
-source venv/bin/activate
+echo "[synco] Upgrading pip inside venv..."
+"$PROJECT_DIR/venv/bin/python" -m pip install --upgrade pip >/dev/null
 
-echo "[*] Upgrading pip..."
-pip install --upgrade pip
+echo "[synco] Making main.py executable..."
+chmod +x "$PROJECT_DIR/main.py"
 
-echo "[*] Installing dependencies..."
-pip install flask watchdog
+echo "[synco] Creating start.sh..."
+cat > "$PROJECT_DIR/start.sh" <<'SH'
+#!/usr/bin/env bash
+set -e
+cd "$(dirname "$0")"
+./venv/bin/python main.py &
+echo "[synco] Started in background. Check synco.pid and logs above."
+SH
+chmod +x "$PROJECT_DIR/start.sh"
 
-echo "[*] Checking for rclone..."
-if ! command -v rclone &> /dev/null; then
-    echo "rclone not found. Install it first:"
-    echo "  Arch:   sudo pacman -S rclone"
-    echo "  Debian: sudo apt install rclone"
-    exit 1
-fi
+echo "[synco] Creating stop.sh..."
+cat > "$PROJECT_DIR/stop.sh" <<'SH'
+#!/usr/bin/env bash
+set -e
+cd "$(dirname "$0")"
+./venv/bin/python main.py --stop
+SH
+chmod +x "$PROJECT_DIR/stop.sh"
 
-RCLONE_CONF="$HOME/.config/rclone/rclone.conf"
-
-echo "------------------------------------------"
-if [ ! -f "$RCLONE_CONF" ]; then
-    echo "[*] No rclone config found. Starting 'rclone config'..."
-    echo "    A browser window will open for Google Drive login."
-    rclone config
-else
-    echo "[*] rclone already configured. Skipping login."
-fi
-
-echo "------------------------------------------"
-echo "[*] Starting CloudSync (main.py)..."
-exec python main.py
+echo
+echo "[synco] Install complete."
+echo "Next steps:"
+echo "  1. Install rclone and configure a remote (see README)."
+echo "  2. Create and edit synco.json in this folder."
+echo "  3. Run ./start.sh to start syncing."
+echo "  4. Run ./stop.sh to stop."

@@ -1,207 +1,225 @@
 #!/usr/bin/env python3
 """
-CloudSync Core - main.py
-Cross-platform (Windows + Linux)
-CLI launcher + temporary localhost web setup
-Uses rclone for trusted, efficient syncing
+Synco: tiny rclone-based sync loop with start/stop via PID file.
+
+- Uses rclone to sync a local folder to a remote.
+- Reads settings from synco.json in the same directory.
+- Can run once (--once) or in a loop with a fixed interval.
+- Uses a PID file (synco.pid) so you can start/stop cleanly.
+
+This script is intentionally minimal: stdlib only, no extra deps.
 """
 
-import os
+import argparse
 import json
-import time
-import threading
+import os
+import signal
 import subprocess
-import webbrowser
-from flask import Flask, request, render_template_string
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
+import sys
+import time
 
-# ================= CONFIG PATHS =================
-
-def get_config_dir():
-    if os.name == "nt":
-        base = os.getenv("APPDATA") or os.path.expanduser("~")
-        path = os.path.join(base, "CloudSyncLite")
-    else:
-        base = os.path.join(os.path.expanduser("~"), ".config")
-        path = os.path.join(base, "cloudsync-lite")
-    os.makedirs(path, exist_ok=True)
-    return path
-
-CONFIG_DIR = get_config_dir()
-CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
-
-DEFAULT_CONFIG = {
-    "local_folder": "",
-    "remote_name": "gdrive",
-    "remote_subpath": "",
-    "mode": "timer",
-    "interval_minutes": 30
-}
-
-# ================= WEB UI =================
-
-app = Flask(__name__)
-
-HTML_UI = """
-<!DOCTYPE html>
-<html>
-<head>
-<title>CloudSync Setup</title>
-<style>
-body{background:#020617;color:#e2e8f0;font-family:sans-serif}
-.box{max-width:500px;margin:40px auto;background:#0f172a;padding:20px;border-radius:12px}
-input,select{width:100%;padding:8px;margin-top:8px;background:#020617;color:#fff;border:1px solid #1f2937;border-radius:6px}
-button{margin-top:16px;width:100%;padding:10px;background:#38bdf8;border:none;border-radius:999px;font-weight:bold}
-</style>
-</head>
-<body>
-<div class="box">
-<h2>CloudSync Setup</h2>
-<form method="post">
-<label>Folder to sync</label>
-<input name="local_folder" value="{{local_folder}}" required>
-
-<label>Rclone remote name</label>
-<input name="remote_name" value="{{remote_name}}" required>
-
-<label>Remote subfolder (optional)</label>
-<input name="remote_subpath" value="{{remote_subpath}}">
-
-<label>Mode</label>
-<select name="mode">
-  <option value="timer" {% if mode=='timer' %}selected{% endif %}>Timer</option>
-  <option value="realtime" {% if mode=='realtime' %}selected{% endif %}>Realtime</option>
-</select>
-
-<label>Interval (minutes)</label>
-<input type="number" name="interval_minutes" value="{{interval_minutes}}">
-
-<button type="submit">Save</button>
-{% if saved %}<p>Saved. You can close this tab.</p>{% endif %}
-</form>
-</div>
-</body>
-</html>
-"""
+PIDFILE = "synco.pid"
+DEFAULT_INTERVAL = 60  # seconds
+DEFAULT_CONFIG = "synco.json"
 
 
-def load_config():
-    if not os.path.exists(CONFIG_PATH):
-        return DEFAULT_CONFIG.copy()
-    with open(CONFIG_PATH, "r") as f:
-        data = json.load(f)
-    cfg = DEFAULT_CONFIG.copy()
-    cfg.update(data)
+def is_running(pidfile: str = PIDFILE) -> bool:
+    """Return True if a previous synco process is still running."""
+    if not os.path.exists(pidfile):
+        return False
+
+    try:
+        with open(pidfile, "r", encoding="utf-8") as f:
+            pid = int(f.read().strip())
+        # If this doesn't raise, process exists (on POSIX).
+        # On Windows, os.kill with sig=0 is also a basic existence check.
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        # Stale PID file – remove it.
+        try:
+            os.remove(pidfile)
+        except Exception:
+            pass
+        return False
+
+
+def write_pid(pidfile: str = PIDFILE) -> None:
+    """Write the current process PID to pidfile."""
+    with open(pidfile, "w", encoding="utf-8") as f:
+        f.write(str(os.getpid()))
+
+
+def remove_pid(pidfile: str = PIDFILE) -> None:
+    """Remove the PID file if it exists."""
+    try:
+        os.remove(pidfile)
+    except Exception:
+        pass
+
+
+def load_config(path: str) -> dict:
+    """Load JSON config file."""
+    if not os.path.exists(path):
+        print(f"[synco] Config not found: {path}")
+        sys.exit(1)
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except json.JSONDecodeError as e:
+        print(f"[synco] Failed to parse {path}: {e}")
+        sys.exit(1)
+
+    required = ["local", "remote"]
+    for key in required:
+        if key not in cfg:
+            print(f"[synco] Missing required key in config: {key}")
+            sys.exit(1)
+
     return cfg
 
 
-def save_config(cfg):
-    with open(CONFIG_PATH, "w") as f:
-        json.dump(cfg, f, indent=2)
+def run_rclone(cfg: dict, extra_flags: list[str]) -> int:
+    """
+    Run a single rclone sync.
+
+    Required config keys:
+      - local
+      - remote
+
+    Optional config keys:
+      - buffer_size (default "1M")
+      - log_level  (default "ERROR")
+      - bwlimit    (e.g. "2M")
+    """
+    local = cfg["local"]
+    remote = cfg["remote"]
+
+    buffer_size = cfg.get("buffer_size", "1M")
+    log_level = cfg.get("log_level", "ERROR")
+    bwlimit = cfg.get("bwlimit")
+
+    cmd = [
+        "rclone",
+        "sync",
+        local,
+        remote,
+        "--transfers",
+        "1",
+        "--checkers",
+        "1",
+        "--buffer-size",
+        buffer_size,
+        "--log-level",
+        log_level,
+    ]
+
+    if bwlimit:
+        cmd += ["--bwlimit", bwlimit]
+
+    if extra_flags:
+        cmd += extra_flags
+
+    print("[synco] Running:", " ".join(cmd))
+
+    try:
+        result = subprocess.run(cmd)
+        rc = result.returncode
+    except FileNotFoundError:
+        print("[synco] rclone not found. Make sure it is installed and in your PATH.")
+        return 127
+
+    if rc == 0:
+        print("[synco] Sync finished successfully.")
+    else:
+        print(f"[synco] Sync finished with exit code {rc}.")
+
+    return rc
 
 
-@app.route("/", methods=["GET", "POST"])
-def setup_page():
-    cfg = load_config()
-    saved = False
-    if request.method == "POST":
-        cfg["local_folder"] = request.form["local_folder"]
-        cfg["remote_name"] = request.form["remote_name"]
-        cfg["remote_subpath"] = request.form["remote_subpath"]
-        cfg["mode"] = request.form["mode"]
-        cfg["interval_minutes"] = int(request.form.get("interval_minutes", 30))
-        save_config(cfg)
-        saved = True
-    return render_template_string(HTML_UI, saved=saved, **cfg)
-
-
-def start_web_ui():
-    threading.Timer(1, lambda: webbrowser.open("http://127.0.0.1:8765")).start()
-    app.run(port=8765, debug=False)
-
-# ================= SYNC ENGINE =================
-
-
-def build_remote(cfg):
-    base = os.path.basename(os.path.abspath(cfg["local_folder"]))
-    sub = cfg["remote_subpath"] or base
-    return f"{cfg['remote_name']}:{sub}"
-
-
-def run_sync(cfg):
-    if not cfg["local_folder"]:
-        print("No folder configured.")
+def stop_existing(pidfile: str = PIDFILE) -> None:
+    """Attempt to stop a running synco instance."""
+    if not os.path.exists(pidfile):
+        print("[synco] Not running (no PID file).")
         return
 
-    remote = build_remote(cfg)
-    print(f"Syncing -> {remote}")
+    try:
+        with open(pidfile, "r", encoding="utf-8") as f:
+            pid = int(f.read().strip())
+    except Exception:
+        print("[synco] Failed to read PID file, removing.")
+        remove_pid(pidfile)
+        return
 
-    subprocess.run([
-        "rclone", "sync",
-        cfg["local_folder"],
-        remote,
-        "--fast-list",
-        "--transfers", "2",
-        "--checkers", "2"
-    ])
+    try:
+        print(f"[synco] Sending SIGTERM to PID {pid}.")
+        os.kill(pid, signal.SIGTERM)
+    except Exception as e:
+        print(f"[synco] Failed to signal process: {e}")
 
-
-class ChangeHandler(FileSystemEventHandler):
-    def __init__(self, cfg):
-        self.cfg = cfg
-        self.timer = None
-
-    def on_any_event(self, event):
-        if self.timer:
-            self.timer.cancel()
-        self.timer = threading.Timer(3, lambda: run_sync(self.cfg))
-        self.timer.start()
+    # Clean up PID regardless – if it’s still running, next is_running() will detect.
+    remove_pid(pidfile)
+    print("[synco] Stopped (or at least tried).")
 
 
-def realtime_loop(cfg):
-    obs = Observer()
-    obs.schedule(ChangeHandler(cfg), cfg["local_folder"], recursive=True)
-    obs.start()
-    print("Realtime sync active...")
-    while True:
-        time.sleep(1)
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Synco: tiny rclone sync loop")
+    parser.add_argument(
+        "--config",
+        "-c",
+        default=DEFAULT_CONFIG,
+        help=f"Path to JSON config (default: {DEFAULT_CONFIG})",
+    )
+    parser.add_argument(
+        "--once", action="store_true", help="Run a single sync and exit"
+    )
+    parser.add_argument(
+        "--interval",
+        "-i",
+        type=int,
+        default=DEFAULT_INTERVAL,
+        help=f"Interval between syncs in seconds (default: {DEFAULT_INTERVAL})",
+    )
+    parser.add_argument(
+        "--stop",
+        action="store_true",
+        help="Stop a running synco process (using PID file)",
+    )
+    parser.add_argument(
+        "--no-create-pid",
+        action="store_true",
+        help="Do not create PID file (useful for debugging)",
+    )
+
+    args = parser.parse_args()
+
+    if args.stop:
+        stop_existing()
+        return
+
+    if is_running():
+        print("[synco] Another synco instance is already running. Exiting.")
+        return
+
+    cfg = load_config(args.config)
+    extra_flags = cfg.get("extra_flags", [])
+
+    if not args.no_create_pid:
+        write_pid()
+
+    try:
+        if args.once:
+            run_rclone(cfg, extra_flags)
+        else:
+            while True:
+                run_rclone(cfg, extra_flags)
+                time.sleep(args.interval)
+    except KeyboardInterrupt:
+        print("[synco] Interrupted by user.")
+    finally:
+        remove_pid()
 
 
-def timer_loop(cfg):
-    print(f"Sync every {cfg['interval_minutes']} minutes")
-    while True:
-        run_sync(cfg)
-        time.sleep(cfg["interval_minutes"] * 60)
-
-# ================= CLI MENU =================
-
-
-def menu():
-    while True:
-        os.system('cls' if os.name=='nt' else 'clear')
-        cfg = load_config()
-        print("=============================")
-        print("      CloudSync Lite")
-        print("=============================")
-        print("1. Open Web Setup")
-        print("2. Start Sync Engine")
-        print("3. Sync Now")
-        print("4. Exit")
-        choice = input("Select: ")
-
-        if choice == '1':
-            start_web_ui()
-        elif choice == '2':
-            if cfg['mode'] == 'realtime':
-                realtime_loop(cfg)
-            else:
-                timer_loop(cfg)
-        elif choice == '3':
-            run_sync(cfg)
-        elif choice == '4':
-            break
-
-
-if __name__ == '__main__':
-    menu()
+if __name__ == "__main__":
+    main()
